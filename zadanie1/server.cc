@@ -111,6 +111,7 @@ int main(int argc, char *argv[]) {
             && difftime(current_time, client.second) <= 120) {
 
           struct sockaddr_in to;
+          socklen_t to_len = sizeof(to);
           to.sin_family = AF_INET;
           to.sin_addr.s_addr = client.first.first;
           to.sin_port = client.first.second;
@@ -122,8 +123,8 @@ int main(int argc, char *argv[]) {
                   inet_ntop(AF_INET, &to.sin_addr, str2, INET_ADDRSTRLEN),
                   ntohs(to.sin_port));
 
-          checkerr((int)sendto(recv_pollfd.fd, &send_buffer, send_buffer_size, 0,
-                               (struct sockaddr*) &from, fromlen), "sendto");
+          checkerr((int)sendto(recv_pollfd.fd, &send_buffer, send_buffer_size,
+                               0, (struct sockaddr*) &to, to_len), "sendto");
         }
       }
     }
