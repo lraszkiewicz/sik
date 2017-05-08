@@ -1,33 +1,53 @@
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <netdb.h>
-#include <stdio.h>
-#include <string.h>
+#include <netinet/in.h>
+#include <cstdio>
 #include <unistd.h>
-#include <stdlib.h>
+#include <cstdint>
+#include <cstdlib>
+#include <poll.h>
+#include <csignal>
+#include <arpa/inet.h>
+#include <byteswap.h>
+#include <ctime>
+#include <cinttypes>
+#include <netdb.h>
 
 #include "err.h"
+#include "datagram.h"
 
-#define BUFFER_SIZE 1000
+#define PORT_DEFAULT 20160
+
+bool finish = false;
+
+static void catch_int(int sig) {
+  finish = true;
+  fprintf(stderr, "\nSignal %d catched, closing.\n", sig);
+}
 
 int main(int argc, char *argv[]) {
-  int sock;
+
+  if (argc < 4 || argc > 5)
+    fatal("Usage: %s timestamp c host [port]", argv[0]);
+
+  uint64_t timestamp = strtoull(argv[1], NULL, 10);
+
+  if (strlen(argv[2]) != 1)
+    fatal("Invalid 'c' argument");
+  char c = argv[2][0];
+
+  uint16_t port = PORT_DEFAULT;
+  if (argc == 5) {
+    long port_long = strtol(argv[4], NULL, 10);
+    if (errno == ERANGE || port_long <= 0 || port_long > UINT16_MAX)
+      fatal("\"%s\" is not a valid and positive uint16_t", argv[4]);
+    port = (uint16_t) port_long;
+  }
+  char port_string[10];
+  sprintf(port_string, "%d", port);
+
   struct addrinfo addr_hints;
   struct addrinfo *addr_result;
-
-  int i, flags, sflags;
-  char buffer[BUFFER_SIZE];
-  size_t len;
-  ssize_t snd_len, rcv_len;
-  struct sockaddr_in my_address;
-  struct sockaddr_in srvr_address;
-  socklen_t rcva_len;
-
-  if (argc < 3) {
-    fatal("Usage: %s host port message ...\n", argv[0]);
-  }
-
-  // 'converting' host/port in string to struct addrinfo
   (void) memset(&addr_hints, 0, sizeof(struct addrinfo));
   addr_hints.ai_family = AF_INET; // IPv4
   addr_hints.ai_socktype = SOCK_DGRAM;
@@ -37,52 +57,66 @@ int main(int argc, char *argv[]) {
   addr_hints.ai_addr = NULL;
   addr_hints.ai_canonname = NULL;
   addr_hints.ai_next = NULL;
-  if (getaddrinfo(argv[1], NULL, &addr_hints, &addr_result) != 0) {
+  if (getaddrinfo(argv[3], port_string, &addr_hints, &addr_result) != 0)
     syserr("getaddrinfo");
-  }
 
-  my_address.sin_family = AF_INET; // IPv4
+  struct sockaddr_in my_address;
+  my_address.sin_family = AF_INET;
   my_address.sin_addr.s_addr =
-      ((struct sockaddr_in*) (addr_result->ai_addr))->sin_addr.s_addr; // address IP
-  my_address.sin_port = htons((uint16_t) atoi(argv[2])); // port from the command line
+      ((struct sockaddr_in*) (addr_result->ai_addr))->sin_addr.s_addr;
+  my_address.sin_port = htons(port);
 
   freeaddrinfo(addr_result);
 
-  sock = socket(PF_INET, SOCK_DGRAM, 0);
+  int sock = socket(PF_INET, SOCK_DGRAM, 0);
   if (sock < 0)
     syserr("socket");
 
-  for (i = 3; i < argc; i++) {
-    len = strnlen(argv[i], BUFFER_SIZE);
-    if (len == BUFFER_SIZE) {
-      (void) fprintf(stderr, "ignoring long parameter %d\n", i);
-      continue;
-    }
-    (void) printf("sending to socket: %s\n", argv[i]);
-    sflags = 0;
-    rcva_len = (socklen_t) sizeof(my_address);
-    snd_len = sendto(sock, argv[i], len, sflags,
-        (struct sockaddr *) &my_address, rcva_len);
-    if (snd_len != (ssize_t) len) {
-      syserr("partial / failed write");
-    }
-
-    (void) memset(buffer, 0, sizeof(buffer));
-    flags = 0;
-    len = (size_t) sizeof(buffer) - 1;
-    rcva_len = (socklen_t) sizeof(srvr_address);
-    rcv_len = recvfrom(sock, buffer, len, flags,
-        (struct sockaddr *) &srvr_address, &rcva_len);
-
-    if (rcv_len < 0) {
-      syserr("read");
-    }
-    (void) printf("read from socket: %zd bytes: %s\n", rcv_len, buffer);
+  if (signal(SIGINT, catch_int) == SIG_ERR) {
+    syserr("Unable to change signal handler");
+    exit(EXIT_FAILURE);
   }
 
-  if (close(sock) == -1) { //very rare errors can occur here, but then
-    syserr("close"); //it's healthy to do the check
+  socklen_t addrlen = sizeof(my_address);
+  small_datagram_t send_buffer;
+  send_buffer.timestamp = bswap_64(timestamp);
+  send_buffer.c = c;
+  checkerr((int) sendto(sock, &send_buffer, sizeof(send_buffer), 0,
+                        (struct sockaddr*) &my_address, addrlen), "sendto");
+
+  datagram_with_file_t recv_buffer;
+  struct sockaddr_in server_address;
+  socklen_t server_addrlen = sizeof(server_address);
+
+  struct pollfd recv_pollfd;
+  recv_pollfd.fd = sock;
+  recv_pollfd.events = POLLIN;
+  recv_pollfd.revents = 0;
+
+  while (true) {
+    recv_pollfd.revents = 0;
+
+    if (finish) {
+      checkerr(close(sock), "close");
+      break;
+    }
+
+    checkerr(poll(&recv_pollfd, 1, 5000), "poll");
+
+    if (recv_pollfd.revents & POLLIN) {
+      ssize_t recv_size = recvfrom(
+          sock, &recv_buffer, sizeof(recv_buffer), 0,
+          (struct sockaddr *) &server_address, &server_addrlen);
+      checkerr((int) recv_size, "recvfrom");
+
+      printf("%" PRIu64 " %c %s\n",
+             bswap_64(recv_buffer.timestamp),
+             recv_buffer.c,
+             recv_buffer.file_content);
+    }
   }
+
+  close(sock);
 
   return 0;
 }

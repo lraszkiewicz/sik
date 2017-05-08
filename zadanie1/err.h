@@ -32,4 +32,9 @@ void fatal(const char *fmt, ...) {
   exit(EXIT_FAILURE);
 }
 
+void checkerr(int ret, const char *fmt) {
+  if (ret < 0)
+    syserr(fmt);
+}
+
 #endif
