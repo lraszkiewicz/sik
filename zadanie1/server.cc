@@ -108,7 +108,7 @@ int main(int argc, char *argv[]) {
 
       for (auto client : client_map) {
         if (client.first != make_pair(from.sin_addr.s_addr, from.sin_port)
-            && difftime(current_time, client.second) <= 120) {
+            && difftime(current_time, client.second) <= 120.0) {
 
           struct sockaddr_in to;
           socklen_t to_len = sizeof(to);

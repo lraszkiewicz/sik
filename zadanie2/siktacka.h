@@ -1,0 +1,6 @@
+#ifndef ZADANIE2_SIKTACKA_H
+#define ZADANIE2_SIKTACKA_H
+
+
+
+#endif //ZADANIE2_SIKTACKA_H
