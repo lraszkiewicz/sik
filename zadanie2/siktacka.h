@@ -41,7 +41,7 @@ struct __attribute__((__packed__)) EventHeader {
   // crc32
 };
 
-struct __attribute__((__packed__)) NewGameEventDataHeader {
+struct __attribute__((__packed__)) NewGameEventData {
   uint32_t width;
   uint32_t height;
   char playerNames[];
