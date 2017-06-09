@@ -6,13 +6,34 @@
 #include <string>
 #include <poll.h>
 #include <zconf.h>
+#include <vector>
+#include <csignal>
+#include <netinet/tcp.h>
 
 #include "siktacka.h"
 #include "util.h"
 
 using namespace std;
 
+const bool DEBUG = false;
+
+//const int DELAY = 1000; // milliseconds between sending messages to server
 const int DELAY = 20; // milliseconds between sending messages to server
+
+const size_t BUF_FROM_GUI_SIZE = 20;
+const size_t BUF_TO_GUI_SIZE = 2000;
+
+const char LEFT_KEY_DOWN[] = "LEFT_KEY_DOWN";
+const char LEFT_KEY_UP[] = "LEFT_KEY_UP";
+const char RIGHT_KEY_DOWN[] = "RIGHT_KEY_DOWN";
+const char RIGHT_KEY_UP[] = "RIGHT_KEY_UP";
+
+bool finish = false;
+
+void catchSigInt(int sig) {
+  finish = true;
+  fprintf(stderr, "Signal %d catched, closing.\n", sig);
+}
 
 void incorrectArguments(char *argv0) {
   fprintf(stderr,
@@ -83,8 +104,6 @@ void parseNetworkAddress(char *address, addrinfo **addrResults, uint16_t *port,
 }
 
 int main(int argc, char *argv[]) {
-  int ret;
-
   // Parse command line arguments.
   if (argc < 3 || argc > 4) {
     fprintf(stderr, "Incorrect amount of command line arguments.\n");
@@ -108,7 +127,10 @@ int main(int argc, char *argv[]) {
       incorrectArguments(argv[0]);
     }
   }
-  fprintf(stderr, "player name: \"%s\"\n", playerName);
+  if (strlen(playerName) > 0)
+    fprintf(stderr, "Player name: %s\n", playerName);
+  else
+    fprintf(stderr, "Player name is empty, joining as observer.\n");
 
   // game_server_host
   addrinfo *serverAddrInfo;
@@ -137,11 +159,6 @@ int main(int argc, char *argv[]) {
   checkSysError(sockets[0].fd, "socket to server");
   sockets[0].events = POLLIN;
   sockets[0].revents = 0;
-  checkSysError(bind(sockets[0].fd, (sockaddr *) &serverAddr,
-                     sizeof(serverAddr)),
-                "bind server socket");
-
-  int sockToServer = socket(serverAddrInfo->ai_family, SOCK_DGRAM, 0);
 
   freeaddrinfo(serverAddrInfo);
 
@@ -154,6 +171,10 @@ int main(int argc, char *argv[]) {
 
   sockets[1].fd = socket(guiAddrInfo->ai_family, SOCK_STREAM, IPPROTO_TCP);
   checkSysError(sockets[1].fd, "socket to GUI");
+  // Disable Nagle's algorithm on this socket.
+  int flagNagle = 1;
+  setsockopt(sockets[1].fd, IPPROTO_TCP, TCP_NODELAY,
+             &flagNagle, sizeof(flagNagle));
   sockets[1].events = POLLIN;
   sockets[1].revents = 0;
   checkSysError(connect(sockets[1].fd, (sockaddr *) &guiAddr, sizeof(guiAddr)),
@@ -161,11 +182,8 @@ int main(int argc, char *argv[]) {
 
   freeaddrinfo(guiAddrInfo);
 
-//  char s[100] = "NEW_GAME 200 200 abc def\n";
-//  checkSysError((int) write(sockets[1].fd, s, strlen(s)), "write to GUI");
-//  while (true) {
-//    usleep(20 * 1000);
-//  }
+  if (signal(SIGINT, catchSigInt) == SIG_ERR)
+    syserr("changing SIGINT handler");
 
   size_t sendBufSize = sizeof(ClientToServerDatagram) + strlen(playerName);
   ClientToServerDatagram *sendBuf =
@@ -175,19 +193,40 @@ int main(int argc, char *argv[]) {
   uint64_t sessionId = currentTime;
   sendBuf->sessionId = htobe64(sessionId);
   int8_t turnDirection = 0;
-  uint32_t lastEventNumber = 0;
-  uint64_t nextSendToServer = sessionId + DELAY * 1000;
+  uint32_t nextEventNumber = 0;
+  uint64_t nextSendToServer = sessionId;
+  vector<string> playerNames;
+  uint32_t currentGameId = 0;
   while (true) {
+    if (finish)
+      break;
+
     currentTime = getCurrentTime();
     if (currentTime >= nextSendToServer) {
       // DELAY ms passed, time to send a message to server.
       sendBuf->turnDirection = turnDirection;
-      sendBuf->nextExpectedEventNumer = htonl(lastEventNumber + 1);
-      if (sendto(sockToServer, sendBuf, sendBufSize, 0,
-                 (sockaddr *) &serverAddr,
-                 (socklen_t) sizeof(serverAddr)) != sendBufSize) {
-        syserr("sendto");
+      sendBuf->nextExpectedEventNumer = htonl(nextEventNumber);
+      if (DEBUG)
+        fprintf(stderr,
+                "Sending to server: turnDirection %" PRId8 ", "
+                "nextExpectedEventNumber %" PRIu32 "\n",
+                turnDirection,
+                nextEventNumber);
+
+      // Attempt to do a non-blocking sendto.
+      ssize_t sendtoRet =
+          sendto(sockets[0].fd, sendBuf, sendBufSize, MSG_DONTWAIT,
+                 (sockaddr *) &serverAddr, (socklen_t) sizeof(serverAddr));
+      // If sendto would block, don't set the non-blocking flag.
+      if (sendtoRet == EAGAIN || sendtoRet == EWOULDBLOCK) {
+        fprintf(stderr, "Sendto would block, attempting without flags.\n");
+        sendtoRet = sendto(sockets[0].fd, sendBuf, sendBufSize, 0,
+                           (sockaddr *) &serverAddr,
+                           (socklen_t) sizeof(serverAddr));
       }
+      if (sendtoRet != sendBufSize)
+        syserr("sendto");
+
       nextSendToServer += DELAY * 1000;
     } else {
       // Try to recieve some data.
@@ -199,58 +238,143 @@ int main(int argc, char *argv[]) {
         syserr("poll");
       } else if (pollRet > 0) {
         if (sockets[0].revents & POLLIN) {
-          // Recieve data from server.
+          // Recieve and parse data from server, send the events to GUI.
+          char messageToGui[BUF_TO_GUI_SIZE];
+          int messageToGuiLength = 0;
           uint8_t buf[MAX_DATAGRAM_SIZE];
           ssize_t recvSize = recv(sockets[0].fd, buf, MAX_DATAGRAM_SIZE, 0);
-          fprintf(stderr, "Recieved %zd bytes from server.\n", recvSize);
+          if (DEBUG)
+            fprintf(stderr, "Recieved %zd bytes from server.\n", recvSize);
           uint32_t gameId = ntohl(*((uint32_t *) buf));
-          fprintf(stderr, "Game ID: %u\n", gameId);
+          if (DEBUG)
+            fprintf(stderr, "Game ID: %u\n", gameId);
           ssize_t eventStart = sizeof(ServerToClientDatagramHeader);
           while (eventStart < recvSize) {
             EventHeader *eventHeader = (EventHeader *) (buf + eventStart);
-            fprintf(stderr, "-- Event:\nlength: %u\nnumber: %u\n",
-                    ntohl(eventHeader->len), ntohl(eventHeader->eventNumber));
+            if (DEBUG)
+              fprintf(stderr, "Event:\nlength: %u\nnumber: %u\n",
+                      ntohl(eventHeader->len), ntohl(eventHeader->eventNumber));
+
+            if (ntohl(eventHeader->eventNumber) + 1 > nextEventNumber
+                || eventHeader->eventType == NEW_GAME)
+              nextEventNumber = ntohl(eventHeader->eventNumber) + 1;
+
             eventStart += sizeof(EventHeader);
+
             if (eventHeader->eventType == NEW_GAME) {
+              fprintf(stderr, "New game.\n");
+              currentGameId = gameId;
+              playerNames.clear();
               NewGameEventDataHeader *eventDataHeader =
                   (NewGameEventDataHeader *) (buf + eventStart);
-              fprintf(stderr, "type: new game\nmaxx: %u\nmaxy: %u\n",
-                      eventDataHeader->width, eventDataHeader->height);
+              messageToGuiLength +=
+                  sprintf(messageToGui + messageToGuiLength,
+                          "NEW_GAME %" PRIu32 " %" PRIu32 " ",
+                          ntohl(eventDataHeader->width),
+                          ntohl(eventDataHeader->height));
               size_t playerListLen = ntohl(eventHeader->len)
-                                     + sizeof(EventHeader) - sizeof(uint32_t)
-                                     + sizeof(NewGameEventDataHeader);
-              fputs("player names: \n", stderr);
+                                     - sizeof(EventHeader)
+                                     + sizeof(uint32_t) // len itself
+                                     - sizeof(NewGameEventDataHeader);
+              string playerNameString;
               for (size_t i = 0; i < playerListLen; ++i) {
-                if (eventDataHeader->playerNames[i] == 0)
-                  fputs("", stderr);
-                else
-                  fprintf(stderr, "%c", eventDataHeader->playerNames[i]);
+                if (eventDataHeader->playerNames[i] == 0) {
+                  messageToGui[messageToGuiLength] = ' ';
+                  playerNames.push_back(playerNameString);
+                  playerNameString.clear();
+                } else {
+                  messageToGui[messageToGuiLength] =
+                      eventDataHeader->playerNames[i];
+                  playerNameString += eventDataHeader->playerNames[i];
+                }
+                ++messageToGuiLength;
               }
+              messageToGui[messageToGuiLength] = '\n';
+              ++messageToGuiLength;
               eventStart += sizeof(NewGameEventDataHeader) + playerListLen;
+
             } else if (eventHeader->eventType == PIXEL) {
               PixelEventData *eventData = (PixelEventData *) (buf + eventStart);
-              fprintf(stderr, "type: pixel\nplayer number: %u\nx: %u\ny: %u\n",
-                      eventData->playerNumber, eventData->x, eventData->y);
+              if (gameId == currentGameId)
+                messageToGuiLength +=
+                    sprintf(messageToGui + messageToGuiLength,
+                            "PIXEL %" PRIu32 " %" PRIu32 " %s\n",
+                            ntohl(eventData->x),
+                            ntohl(eventData->y),
+                            playerNames[eventData->playerNumber].c_str());
               eventStart += sizeof(PixelEventData);
+
             } else if (eventHeader->eventType == PLAYER_ELIMINATED) {
               PlayerEliminatedEventData *eventData =
                   (PlayerEliminatedEventData *) (buf + eventStart);
-              fprintf(stderr, "type: player eliminated\nplayer number: %u\n",
-                      eventData->playerNumber);
+              if (gameId == currentGameId)
+                messageToGuiLength +=
+                    sprintf(messageToGui + messageToGuiLength,
+                            "PLAYER_ELIMINATED %s\n",
+                            playerNames[eventData->playerNumber].c_str());
               eventStart += sizeof(PlayerEliminatedEventData);
-            } else if (eventHeader->eventType == GAME_OVER) {
 
+            } else if (eventHeader->eventType == GAME_OVER) {
+              fprintf(stderr, "Game over!\n");
             }
-            fprintf(stderr, "crc32: %u\n", *((uint32_t *)(buf + eventStart)));
+
+            if (DEBUG)
+              fprintf(stderr, "crc32: %u\n",
+                      ntohl(*((uint32_t *)(buf + eventStart))));
             eventStart += sizeof(uint32_t);
           }
+          if (DEBUG)
+            fprintf(stderr, "%.*s", messageToGuiLength, messageToGui);
+          checkSysError((int) write(sockets[1].fd, messageToGui,
+                                    (size_t) messageToGuiLength),
+                        "write to GUI");
         }
         if (sockets[1].revents & POLLIN) {
           // Revieve data from GUI.
+          char buf[BUF_FROM_GUI_SIZE];
+          ssize_t readBytes = read(sockets[1].fd, buf, BUF_FROM_GUI_SIZE);
+          if (readBytes < 0)
+            syserr("read");
+          else if (readBytes == 0) {
+            fprintf(stderr, "Connection with GUI ended, exiting.\n");
+            exit(EXIT_SUCCESS);
+          }
+          else if (readBytes == BUF_FROM_GUI_SIZE) {
+            fprintf(stderr, "Message from GUI too long, ignoring.\n");
+            continue;
+          }
+          buf[readBytes] = 0;
+
+          if (DEBUG)
+            fprintf(stderr, "Read %zd bytes from GUI: %.*s",
+                    readBytes, (int) readBytes, buf);
+
+          if (strncmp(buf, LEFT_KEY_DOWN, sizeof(LEFT_KEY_DOWN) - 1) == 0) {
+            turnDirection = -1;
+          } else if (strncmp(buf, RIGHT_KEY_DOWN,
+                             sizeof(RIGHT_KEY_DOWN) - 1) == 0) {
+            turnDirection = 1;
+          } else if (strncmp(buf, LEFT_KEY_UP, sizeof(LEFT_KEY_UP) - 1) == 0) {
+            if (turnDirection == -1)
+              turnDirection = 0;
+          } else if (strncmp(buf, RIGHT_KEY_UP,
+                             sizeof(RIGHT_KEY_UP) - 1) == 0) {
+            if (turnDirection == 1)
+              turnDirection = 0;
+          } else {
+            fprintf(stderr,
+                    "Unknown message from GUI (length %zd), ignoring.\n%.*s\n",
+                    readBytes, (int) readBytes, buf);
+          }
+
+          if (DEBUG)
+            fprintf(stderr, "turnDirection: %d\n", turnDirection);
         }
       }
     }
   }
+
+  checkSysError(close(sockets[1].fd), "close socket to GUI");
 
   exit(EXIT_SUCCESS);
 }
