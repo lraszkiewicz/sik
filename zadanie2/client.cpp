@@ -9,6 +9,7 @@
 #include <vector>
 #include <csignal>
 #include <netinet/tcp.h>
+#include <zlib.h>
 
 #include "siktacka.h"
 #include "util.h"
@@ -251,6 +252,22 @@ int main(int argc, char *argv[]) {
           ssize_t eventStart = sizeof(ServerToClientDatagramHeader);
           while (eventStart < recvSize) {
             EventHeader *eventHeader = (EventHeader *) (buf + eventStart);
+            uint32_t eventLen = ntohl(eventHeader->len);
+
+            uint32_t crcCalculated = (uint32_t)
+                crc32(0, buf + eventStart, eventLen + sizeof(uint32_t));
+
+            printf("Calculated CRC32: %u\n", crcCalculated);
+
+            uint32_t crcDownloaded =
+                ntohl(*((uint32_t *)(buf + eventStart + eventLen
+                                     - sizeof(uint32_t))));
+
+            printf("Downloaded CRC32: %u\n", crcDownloaded);
+
+            if (crcDownloaded != crcCalculated)
+              fprintf(stderr, "Invalid crc\n");
+
             if (DEBUG)
               fprintf(stderr, "Event:\nlength: %u\nnumber: %u\n",
                       ntohl(eventHeader->len), ntohl(eventHeader->eventNumber));
@@ -318,9 +335,6 @@ int main(int argc, char *argv[]) {
               fprintf(stderr, "Game over!\n");
             }
 
-            if (DEBUG)
-              fprintf(stderr, "crc32: %u\n",
-                      ntohl(*((uint32_t *)(buf + eventStart))));
             eventStart += sizeof(uint32_t);
           }
           if (DEBUG)
@@ -329,8 +343,9 @@ int main(int argc, char *argv[]) {
                                     (size_t) messageToGuiLength),
                         "write to GUI");
         }
+
         if (sockets[1].revents & POLLIN) {
-          // Revieve data from GUI.
+          // Recieve data from GUI.
           char buf[BUF_FROM_GUI_SIZE];
           ssize_t readBytes = read(sockets[1].fd, buf, BUF_FROM_GUI_SIZE);
           if (readBytes < 0)
