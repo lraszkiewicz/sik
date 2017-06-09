@@ -12,6 +12,8 @@
 
 using namespace std;
 
+const int DELAY = 20; // milliseconds between sending messages to server
+
 void incorrectArguments(char *argv0) {
   fprintf(stderr,
           "Usage: %s player_name game_server_host[:port]"
@@ -139,6 +141,8 @@ int main(int argc, char *argv[]) {
                      sizeof(serverAddr)),
                 "bind server socket");
 
+  int sockToServer = socket(serverAddrInfo->ai_family, SOCK_DGRAM, 0);
+
   freeaddrinfo(serverAddrInfo);
 
   // TCP sockets for GUI connection.
@@ -149,7 +153,7 @@ int main(int argc, char *argv[]) {
   guiAddr.sin_port = htons(guiPort);
 
   sockets[1].fd = socket(guiAddrInfo->ai_family, SOCK_STREAM, IPPROTO_TCP);
-  checkSysError(sockets[0].fd, "socket to GUI");
+  checkSysError(sockets[1].fd, "socket to GUI");
   sockets[1].events = POLLIN;
   sockets[1].revents = 0;
   checkSysError(connect(sockets[1].fd, (sockaddr *) &guiAddr, sizeof(guiAddr)),
@@ -172,26 +176,79 @@ int main(int argc, char *argv[]) {
   sendBuf->sessionId = htobe64(sessionId);
   int8_t turnDirection = 0;
   uint32_t lastEventNumber = 0;
-  uint64_t nextSendToServer = sessionId + 20 * 1000;
+  uint64_t nextSendToServer = sessionId + DELAY * 1000;
   while (true) {
     currentTime = getCurrentTime();
     if (currentTime >= nextSendToServer) {
-      // 20 ms passed, time to send a message to server.
+      // DELAY ms passed, time to send a message to server.
       sendBuf->turnDirection = turnDirection;
-      sendBuf->nextExpectedEventNumer = lastEventNumber + 1;
-      if (sendto(sockets[0].fd, sendBuf, sendBufSize, 0,
-                 (sockaddr *)&serverAddr, sizeof(serverAddr)) < sendBufSize) {
+      sendBuf->nextExpectedEventNumer = htonl(lastEventNumber + 1);
+      if (sendto(sockToServer, sendBuf, sendBufSize, 0,
+                 (sockaddr *) &serverAddr,
+                 (socklen_t) sizeof(serverAddr)) != sendBufSize) {
         syserr("sendto");
       }
-      nextSendToServer += 20 * 1000;
+      nextSendToServer += DELAY * 1000;
     } else {
       // Try to recieve some data.
       sockets[0].revents = 0;
       sockets[1].revents = 0;
-      checkSysError(poll(sockets, 2,
-                         (int) ((nextSendToServer - currentTime) / 1000)),
-                    "poll");
-      
+      int pollRet =
+          poll(sockets, 2, (int) ((nextSendToServer - currentTime) / 1000));
+      if (pollRet < 0) {
+        syserr("poll");
+      } else if (pollRet > 0) {
+        if (sockets[0].revents & POLLIN) {
+          // Recieve data from server.
+          uint8_t buf[MAX_DATAGRAM_SIZE];
+          ssize_t recvSize = recv(sockets[0].fd, buf, MAX_DATAGRAM_SIZE, 0);
+          fprintf(stderr, "Recieved %zd bytes from server.\n", recvSize);
+          uint32_t gameId = ntohl(*((uint32_t *) buf));
+          fprintf(stderr, "Game ID: %u\n", gameId);
+          ssize_t eventStart = sizeof(ServerToClientDatagramHeader);
+          while (eventStart < recvSize) {
+            EventHeader *eventHeader = (EventHeader *) (buf + eventStart);
+            fprintf(stderr, "-- Event:\nlength: %u\nnumber: %u\n",
+                    ntohl(eventHeader->len), ntohl(eventHeader->eventNumber));
+            eventStart += sizeof(EventHeader);
+            if (eventHeader->eventType == NEW_GAME) {
+              NewGameEventDataHeader *eventDataHeader =
+                  (NewGameEventDataHeader *) (buf + eventStart);
+              fprintf(stderr, "type: new game\nmaxx: %u\nmaxy: %u\n",
+                      eventDataHeader->width, eventDataHeader->height);
+              size_t playerListLen = ntohl(eventHeader->len)
+                                     + sizeof(EventHeader) - sizeof(uint32_t)
+                                     + sizeof(NewGameEventDataHeader);
+              fputs("player names: \n", stderr);
+              for (size_t i = 0; i < playerListLen; ++i) {
+                if (eventDataHeader->playerNames[i] == 0)
+                  fputs("", stderr);
+                else
+                  fprintf(stderr, "%c", eventDataHeader->playerNames[i]);
+              }
+              eventStart += sizeof(NewGameEventDataHeader) + playerListLen;
+            } else if (eventHeader->eventType == PIXEL) {
+              PixelEventData *eventData = (PixelEventData *) (buf + eventStart);
+              fprintf(stderr, "type: pixel\nplayer number: %u\nx: %u\ny: %u\n",
+                      eventData->playerNumber, eventData->x, eventData->y);
+              eventStart += sizeof(PixelEventData);
+            } else if (eventHeader->eventType == PLAYER_ELIMINATED) {
+              PlayerEliminatedEventData *eventData =
+                  (PlayerEliminatedEventData *) (buf + eventStart);
+              fprintf(stderr, "type: player eliminated\nplayer number: %u\n",
+                      eventData->playerNumber);
+              eventStart += sizeof(PlayerEliminatedEventData);
+            } else if (eventHeader->eventType == GAME_OVER) {
+
+            }
+            fprintf(stderr, "crc32: %u\n", *((uint32_t *)(buf + eventStart)));
+            eventStart += sizeof(uint32_t);
+          }
+        }
+        if (sockets[1].revents & POLLIN) {
+          // Revieve data from GUI.
+        }
+      }
     }
   }
 
