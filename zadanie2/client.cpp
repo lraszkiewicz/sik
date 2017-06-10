@@ -16,7 +16,7 @@
 
 using namespace std;
 
-const bool DEBUG = false;
+const bool DEBUG = true;
 
 //const int DELAY = 1000; // milliseconds between sending messages to server
 const int DELAY = 20; // milliseconds between sending messages to server
@@ -231,9 +231,14 @@ int main(int argc, char *argv[]) {
       sockets[1].revents = 0;
       int pollRet =
           poll(sockets, 2, (int) ((nextSendToServer - currentTime) / 1000));
-      if (pollRet < 0) {
-        syserr("poll");
-      } else if (pollRet > 0) {
+      if (pollRet < 0 && errno == EINTR) {
+        fprintf(stderr, "Poll interrupted, finishing.\n");
+        finish = true;
+        break;
+      } else {
+        checkSysError(pollRet, "poll");
+      }
+      if (pollRet > 0) {
         if (sockets[0].revents & POLLIN) {
           // Recieve and parse data from server, send the events to GUI.
           char messageToGui[BUF_TO_GUI_SIZE];
@@ -241,7 +246,7 @@ int main(int argc, char *argv[]) {
           uint8_t buf[MAX_DATAGRAM_SIZE + 5];
           ssize_t eventStart = sizeof(ServerToClientDatagramHeader);
 
-          ssize_t recvSize = recv(sockets[0].fd, buf, MAX_DATAGRAM_SIZE + 5, 0);
+          ssize_t recvSize = recv(sockets[0].fd, buf, sizeof(buf), 0);
           if (DEBUG)
             fprintf(stderr, "Recieved %zd bytes from server.\n", recvSize);
 

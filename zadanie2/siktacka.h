@@ -15,7 +15,7 @@ const int PLAYER_NAME_MAX_LENGTH = 64;
 struct __attribute__((__packed__)) ClientToServerDatagram {
   uint64_t sessionId;
   int8_t turnDirection;
-  int32_t nextExpectedEventNumer;
+  uint32_t nextExpectedEventNumer;
   uint8_t playerName[];
 };
 

@@ -47,6 +47,13 @@ void checkSysError(int ret, const char *fmt) {
     syserr(fmt);
 }
 
+// Jak wyżej, ale nie kończy działania programu.
+void checkNonFatal(int ret, const char *fmt) {
+  if (ret < 0)
+    fprintf(stderr, "%s (%d; %s)\n", fmt, errno, strerror(errno));
+}
+
+
 uint32_t parseUInt32(char *str) {
   unsigned long long res = strtoull(str, NULL, 10);
   if (errno == ERANGE || res <= 0 || res > UINT32_MAX) {
