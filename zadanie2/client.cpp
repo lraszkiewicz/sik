@@ -10,15 +10,15 @@
 #include <csignal>
 #include <netinet/tcp.h>
 #include <zlib.h>
+#include <set>
 
 #include "siktacka.h"
 #include "util.h"
 
 using namespace std;
 
-const bool DEBUG = true;
+const bool DEBUG = false;
 
-//const int DELAY = 1000; // milliseconds between sending messages to server
 const int DELAY = 20; // milliseconds between sending messages to server
 
 const size_t BUF_FROM_GUI_SIZE = 20;
@@ -195,6 +195,7 @@ int main(int argc, char *argv[]) {
   uint64_t nextSendToServer = sessionId;
   vector<string> playerNames;
   uint32_t currentGameId = 0, width = 0, height = 0;
+  set<pair<int,int>> events; // {gameId, eventNumber}
   while (true) {
     if (finish)
       break;
@@ -221,7 +222,7 @@ int main(int argc, char *argv[]) {
         sendtoRet = sendto(sockets[0].fd, sendBuf, sendBufSize, 0,
                            serverAddrInfo->ai_addr, serverAddrInfo->ai_addrlen);
       }
-      if (sendtoRet != sendBufSize)
+      if (sendtoRet != (ssize_t) sendBufSize)
         syserr("sendto");
 
       nextSendToServer += DELAY * 1000;
@@ -250,7 +251,7 @@ int main(int argc, char *argv[]) {
           if (DEBUG)
             fprintf(stderr, "Recieved %zd bytes from server.\n", recvSize);
 
-          if (recvSize < sizeof(ServerToClientDatagramHeader)) {
+          if (recvSize < (ssize_t) sizeof(ServerToClientDatagramHeader)) {
             fprintf(stderr, "Datagram from server too small, ignoring.\n");
             continue;
           } else if (recvSize > MAX_DATAGRAM_SIZE) {
@@ -266,7 +267,7 @@ int main(int argc, char *argv[]) {
 
             if (recvSize - eventStart
                 // (len, eventNumber, eventType), crc32
-                < sizeof(EventHeader) + sizeof(uint32_t)) {
+                < (ssize_t) (sizeof(EventHeader) + sizeof(uint32_t))) {
               fprintf(stderr, "Event too small, ignoring.\n");
               break;
             }
@@ -303,6 +304,14 @@ int main(int argc, char *argv[]) {
                 || eventHeader->eventType == NEW_GAME)
               nextEventNumber = ntohl(eventHeader->eventNumber) + 1;
 
+            bool duplicate = false;
+            if (events.find({gameId, ntohl(eventHeader->eventNumber)})
+                != events.end())
+              // Event is a duplicate, don't send it to GUI.
+              duplicate = true;
+
+            events.insert({gameId, ntohl(eventHeader->eventNumber)});
+
             eventStart += sizeof(EventHeader);
 
             if (eventHeader->eventType == NEW_GAME) {
@@ -312,36 +321,41 @@ int main(int argc, char *argv[]) {
               if (sizeof(uint32_t) + sizeof(uint8_t) + sizeof(NewGameEventData)
                   > eventLen)
                 fatal("Declared event len is too short, exiting.");
-              currentGameId = gameId;
-              playerNames.clear();
+              if (!duplicate) {
+                currentGameId = gameId;
+                playerNames.clear();
+              }
               NewGameEventData *eventDataHeader =
                   (NewGameEventData *) (buf + eventStart);
               width = ntohl(eventDataHeader->width);
               height = ntohl(eventDataHeader->height);
-              messageToGuiLength +=
-                  sprintf(messageToGui + messageToGuiLength,
-                          "NEW_GAME %" PRIu32 " %" PRIu32 " ",
-                          ntohl(eventDataHeader->width),
-                          ntohl(eventDataHeader->height));
+              if (!duplicate)
+                messageToGuiLength +=
+                    sprintf(messageToGui + messageToGuiLength,
+                            "NEW_GAME %" PRIu32 " %" PRIu32 " ",
+                            ntohl(eventDataHeader->width),
+                            ntohl(eventDataHeader->height));
               size_t playerListLen = ntohl(eventHeader->len)
                                      - sizeof(EventHeader)
                                      + sizeof(uint32_t) // len itself
                                      - sizeof(NewGameEventData);
-              string playerNameString;
-              for (size_t i = 0; i < playerListLen; ++i) {
-                if (eventDataHeader->playerNames[i] == 0) {
-                  messageToGui[messageToGuiLength] = ' ';
-                  playerNames.push_back(playerNameString);
-                  playerNameString.clear();
-                } else {
-                  messageToGui[messageToGuiLength] =
-                      eventDataHeader->playerNames[i];
-                  playerNameString += eventDataHeader->playerNames[i];
+              if (!duplicate) {
+                string playerNameString;
+                for (size_t i = 0; i < playerListLen; ++i) {
+                  if (eventDataHeader->playerNames[i] == 0) {
+                    messageToGui[messageToGuiLength] = ' ';
+                    playerNames.push_back(playerNameString);
+                    playerNameString.clear();
+                  } else {
+                    messageToGui[messageToGuiLength] =
+                        eventDataHeader->playerNames[i];
+                    playerNameString += eventDataHeader->playerNames[i];
+                  }
+                  ++messageToGuiLength;
                 }
+                messageToGui[messageToGuiLength] = '\n';
                 ++messageToGuiLength;
               }
-              messageToGui[messageToGuiLength] = '\n';
-              ++messageToGuiLength;
               eventStart += sizeof(NewGameEventData) + playerListLen;
 
             } else if (eventHeader->eventType == PIXEL) {
@@ -354,12 +368,13 @@ int main(int argc, char *argv[]) {
                   fatal("Pixel coordinates out of bounds, exiting.");
                 if (eventData->playerNumber >= playerNames.size())
                   fatal("Player number doesn't exist, exiting.");
-                messageToGuiLength +=
-                    sprintf(messageToGui + messageToGuiLength,
-                            "PIXEL %" PRIu32 " %" PRIu32 " %s\n",
-                            ntohl(eventData->x),
-                            ntohl(eventData->y),
-                            playerNames[eventData->playerNumber].c_str());
+                if (!duplicate)
+                  messageToGuiLength +=
+                      sprintf(messageToGui + messageToGuiLength,
+                              "PIXEL %" PRIu32 " %" PRIu32 " %s\n",
+                              ntohl(eventData->x),
+                              ntohl(eventData->y),
+                              playerNames[eventData->playerNumber].c_str());
               }
               eventStart += sizeof(PixelEventData);
 
@@ -371,7 +386,7 @@ int main(int argc, char *argv[]) {
                   (PlayerEliminatedEventData *) (buf + eventStart);
               if (eventData->playerNumber >= playerNames.size())
                 fatal("Player number doesn't exist, exiting.");
-              if (gameId == currentGameId)
+              if (gameId == currentGameId && !duplicate)
                 messageToGuiLength +=
                     sprintf(messageToGui + messageToGuiLength,
                             "PLAYER_ELIMINATED %s\n",

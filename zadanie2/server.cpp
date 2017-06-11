@@ -22,7 +22,7 @@
 
 using namespace std;
 
-const bool DEBUG = true;
+const bool DEBUG = false;
 
 uint32_t WIDTH = 800,
          HEIGHT = 600,
@@ -156,10 +156,12 @@ void createPixel(Snake &snake) {
 }
 
 void moveSnake(Snake &snake) {
+  if (!snake.alive)
+    return;
   snake.angle += snake.turnDirection * ((long double) TURNING_SPEED);
   uint32_t oldX = (uint32_t) snake.x, oldY = (uint32_t) snake.y;
-  snake.x -= cos(snake.angle * M_PIl / 180.0);
-  snake.y -= sin(snake.angle * M_PIl / 180.0);
+  snake.x += cos(snake.angle * M_PIl / 180.0);
+  snake.y += sin(snake.angle * M_PIl / 180.0);
   if ((uint32_t) snake.x != oldX || (uint32_t) snake.y != oldY)
     createPixel(snake);
 }
@@ -200,6 +202,7 @@ void onGameStart() {
   alivePlayers = 0;
   bool moreAllowed = true;
   for (Player &p : players) {
+    p.nextExpectedEvent = 0;
     if (!p.name.empty()
         && usedNames.find(p.name) == usedNames.end()
         && moreAllowed) {
@@ -207,7 +210,6 @@ void onGameStart() {
       if (totalPlayerNameLength <= totalNameLengthLimit) {
         usedNames.insert(p.name);
         playerNames.push_back(p.name);
-        p.nextExpectedEvent = 0;
         p.hasSnake = true;
         p.snake.x = ((long double) (getRandom() % WIDTH)) + 0.5;
         p.snake.y = ((long double) (getRandom() % HEIGHT)) + 0.5;
@@ -241,9 +243,9 @@ void onGameOver() {
 // Delete inactive players who don't have snakes.
 void deleteInactive() {
   for (auto p = players.begin(); p != players.end(); ) {
-    if ((!p->hasSnake)
-        && (getCurrentTime() - p->lastReceiveTime > 2'000'000
-            || p->disconnected)) {
+    if (getCurrentTime() - p->lastReceiveTime > 2'000'000)
+      p->disconnected = true;
+    if ((!p->hasSnake) && p->disconnected) {
       p = players.erase(p);
       continue;
     }
@@ -253,6 +255,9 @@ void deleteInactive() {
 
 // Send events to a player/observer according to their nextExpectedEvent.
 void sendEventsToPlayer(Player &player, uint32_t gameId) {
+  if (player.disconnected)
+    return;
+
   if (player.nextExpectedEvent >= events.size())
     // Nothing to send.
     return;
@@ -264,8 +269,10 @@ void sendEventsToPlayer(Player &player, uint32_t gameId) {
 
   uint8_t datagram[MAX_DATAGRAM_SIZE];
   size_t datagramLen = sizeof(ServerToClientDatagramHeader);
+  if (DEBUG)
+    fprintf(stderr, "Game ID: %u\n", htonl(gameId));
   ((ServerToClientDatagramHeader *) &datagram)->gameId = htonl(gameId);
-  for (int i = player.nextExpectedEvent; i < events.size(); ++i) {
+  for (size_t i = player.nextExpectedEvent; i < events.size(); ++i) {
     Event *event = &events[i];
 
     if (DEBUG) {
@@ -325,7 +332,6 @@ void sendEventsToPlayer(Player &player, uint32_t gameId) {
         size_t j = 0;
         for (string &s : event->playerNames) {
           for (size_t k = 0; k < s.length(); ++k) {
-            fprintf(stderr, "data->playernames[%zu] = %c\n", j, s[k]);
             data->playerNames[j] = s[k];
             ++j;
           }
@@ -367,15 +373,23 @@ void sendEventsToPlayer(Player &player, uint32_t gameId) {
   toAddr.sin6_flowinfo = 0;
   toAddr.sin6_family = AF_INET6;
 
-  ssize_t sentBytes = sendto(sock.fd, datagram, datagramLen, 0,
+  // Attempt to do a non-blocking sendto.
+  ssize_t sentBytes = sendto(sock.fd, datagram, datagramLen, MSG_DONTWAIT,
                              (sockaddr *) &toAddr, sizeof(toAddr));
+  // If sendto would block, don't set the non-blocking flag.
+  if (sentBytes == EAGAIN || sentBytes == EWOULDBLOCK) {
+    fprintf(stderr, "Sendto would block, attempting without flags.\n");
+    sentBytes = sendto(sock.fd, datagram, datagramLen, 0,
+                       (sockaddr *) &toAddr, sizeof(toAddr));
+  }
 
   if (DEBUG)
     fprintf(stderr, "Sent %zd bytes to port %u\n",
             sentBytes, ntohs(toAddr.sin6_port));
-  if (sentBytes < datagramLen) {
+
+  if (sentBytes != (ssize_t) datagramLen) {
     fprintf(stderr, "Sending events not successful.\n");
-    checkNonFatal(-1, "");
+    checkNonFatal(-1, "sendto");
   }
 
   // If all events didn't fit in this datagram, just call this function again.
@@ -462,6 +476,7 @@ int main(int argc, char *argv[]) {
           gameInProgress = true;
         }
       } else {
+        deleteInactive();
         for (Player &p : players) {
           if (p.hasSnake) {
             moveSnake(p.snake);
@@ -472,8 +487,8 @@ int main(int argc, char *argv[]) {
             }
           }
         }
-        sendEvents(gameId);
       }
+      sendEvents(gameId);
       nextRoundTime += roundTime;
 
     } else {
@@ -499,8 +514,9 @@ int main(int argc, char *argv[]) {
         if (recvSize < 0) {
           checkNonFatal((int) recvSize, "recvfrom");
           continue;
-        } else if (recvSize < sizeof(ClientToServerDatagram)
-                   || recvSize > sizeof(ClientToServerDatagram) + 64) {
+        } else if (recvSize < (ssize_t) sizeof(ClientToServerDatagram)
+                   || recvSize > (ssize_t) sizeof(ClientToServerDatagram)
+                                 + PLAYER_NAME_MAX_LENGTH) {
           fprintf(stderr, "Recieved datagram has incorrect size, ignoring.\n");
           continue;
         }
@@ -537,23 +553,31 @@ int main(int argc, char *argv[]) {
               && p.name == playerName
               && !p.disconnected) {
             // It's the same client as saved.
-            if (p.sessionId == be64toh(datagram->sessionId)) {
+            if (be64toh(datagram->sessionId) == p.sessionId) {
               // Same session ID as earlier - matching players.
               player = &p;
               break;
-            } else if (p.sessionId < be64toh(datagram->sessionId)) {
+            } else if (be64toh(datagram->sessionId) > p.sessionId) {
               // Higher session ID - disconnect the old player
               // and create a new one later.
               p.disconnected = true;
+            } else {
+              // Session ID lower than saved - ignore.
+              ignoreThis = true;
             }
+          } else if (p.name == playerName) {
+            // Duplicate name of already saved client - ignoring.
+            ignoreThis = true;
           }
         }
+        if (ignoreThis)
+          continue;
+
         if (player == NULL) {
           Player newPlayer;
           newPlayer.name = playerName;
           newPlayer.ready = false;
           newPlayer.hasSnake = false;
-          newPlayer.disconnected = false;
           newPlayer.sessionId = be64toh(datagram->sessionId);
           newPlayer.nextExpectedEvent =
               ntohl(datagram->nextExpectedEventNumer);
@@ -564,6 +588,7 @@ int main(int argc, char *argv[]) {
         }
 
         player->lastReceiveTime = getCurrentTime();
+        player->disconnected = false;
         player->snake.turnDirection = datagram->turnDirection;
         player->nextExpectedEvent = ntohl(datagram->nextExpectedEventNumer);
 
@@ -572,4 +597,6 @@ int main(int argc, char *argv[]) {
       }
     }
   }
+
+  exit(EXIT_SUCCESS);
 }
